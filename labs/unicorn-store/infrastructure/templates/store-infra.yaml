@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  DatabaseName:
+    Type: String
+    Default: unicorn_database
+  DatabaseUsername:
+    Type: String
+    Default: unicorn
+  DatabasePassword:
+    Type: String
+    Default: password4unicorn4mysql
+  DatabaseRootPassword:
+    Type: String
+    Default: password4root4mysql
+  S3Bucket:
+    Type: String
+    Default: gmartim-aws-elastic-beanstalk-workshop
+
+Resources:
+  IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        }
+      Policies:
+        -
+          PolicyName: !Sub ${AWS::Region}-${AWS::StackName}-S3
+          PolicyDocument: !Sub |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:Get*",
+                    "s3:List*"
+                  ],
+                  "Resource": [
+                    "arn:${AWS::Partition}:s3:::${S3Bucket}/*"
+                  ]
+                }
+              ]
+            }
+
+  IAMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref IAMRole
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      IamInstanceProfile: !Ref IAMInstanceProfile
+      ImageId: ami-095413544ce52437d
+      InstanceType: t3.large
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash -xe
+            apt-get update -y
+            apt-get upgrade -y
+            
+            apt-get install apache2 -y
+            apt-get install awscli -y
+            apt-get install default-jdk -y
+            apt-get install mysql-server -y
+            
+            a2enmod proxy proxy_http
+            systemctl restart apache2
+
+            useradd -m -d /opt/tomcat -U -s /bin/false tomcat
+            
+            cd /tmp
+            
+            wget https://dlcdn.apache.org/tomcat/tomcat-9/v9.0.71/bin/apache-tomcat-9.0.71.tar.gz
+            tar xzvf apache-tomcat-9.0.71.tar.gz -C /opt/tomcat --strip-components=1
+            
+            cat <<EOF > /opt/tomcat/bin/setenv.sh
+            export SPRING_DATASOURCE_USERNAME="${DatabaseUsername}"
+            export SPRING_DATASOURCE_PASSWORD="${DatabasePassword}"
+            EOF
+            
+            chown -R tomcat:tomcat /opt/tomcat/
+            chmod -R u+x /opt/tomcat/bin
+
+            cat <<EOF > /etc/systemd/system/tomcat.service
+            [Unit]
+            Description=Tomcat
+            After=network.target
+            
+            [Service]
+            Type=forking
+            
+            User=tomcat
+            Group=tomcat
+            
+            Environment="JAVA_HOME=/usr/lib/jvm/java-1.11.0-openjdk-amd64"
+            Environment="JAVA_OPTS=-Djava.security.egd=file:///dev/urandom"
+            Environment="CATALINA_BASE=/opt/tomcat"
+            Environment="CATALINA_HOME=/opt/tomcat"
+            Environment="CATALINA_PID=/opt/tomcat/temp/tomcat.pid"
+            Environment="CATALINA_OPTS=-Xms512M -Xmx1024M -server -XX:+UseParallelGC"
+            
+            ExecStart=/opt/tomcat/bin/startup.sh
+            ExecStop=/opt/tomcat/bin/shutdown.sh
+            
+            RestartSec=10
+            Restart=always
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            cat <<EOF > /etc/apache2/sites-enabled/000-default.conf
+            <VirtualHost *:80>
+              ProxyPass / http://localhost:8080/
+              ProxyPassReverse / http://localhost:8080/
+            </VirtualHost>
+            EOF
+            
+            systemctl daemon-reload
+            systemctl start tomcat
+            systemctl enable tomcat
+            systemctl restart apache2
+            
+            cat <<EOF > /tmp/prepare-mysql.sql
+            GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION;
+            FLUSH PRIVILEGES;
+            EOF
+            
+            cat <<EOF > /tmp/prepare-unicorn-database-mysql.sql
+            CREATE DATABASE ${DatabaseName} CHARACTER SET utf8 COLLATE utf8_general_ci;
+            CREATE USER '${DatabaseUsername}'@'%' IDENTIFIED BY '${DatabasePassword}';
+            GRANT ALL PRIVILEGES ON ${DatabaseName}.* TO '${DatabaseUsername}'@'%';
+            FLUSH PRIVILEGES;
+            EOF
+            
+            cat <<EOF > /tmp/create-unicorn-database-mysql.sql
+            USE ${DatabaseName};
+            CREATE TABLE unicorns (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              name VARCHAR(255),
+              age VARCHAR(3),
+              size VARCHAR(15),
+              type VARCHAR(50)
+            );
+            EOF
+            
+            mysql < /tmp/prepare-mysql.sql
+            mysql < /tmp/prepare-unicorn-database-mysql.sql
+            mysql -u ${DatabaseUsername} --password=${DatabasePassword} < /tmp/create-unicorn-database-mysql.sql
+
+            systemctl stop tomcat
+            
+            aws s3 cp s3://${S3Bucket}/store-spring.war /opt/tomcat/webapps/
+            
+            chown -R tomcat:tomcat /opt/tomcat/webapps/
+            
+            systemctl start tomcat
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access via port 80, MySQL access via port 3306 and SSH access via port 22
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+
+  EC2EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref EC2Instance
+
+Outputs:
+  PublicDnsName:
+    Description: Public DNS of EC2 instance
+    Value: !GetAtt EC2Instance.PublicDnsName
